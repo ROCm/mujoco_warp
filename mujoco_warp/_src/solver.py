@@ -3419,10 +3419,21 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
     wp.capture_while(
       nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, step_size_cost=step_size_cost, nsolving=nsolving
     )
+  elif m.opt.iterations != 0 and wp.get_device().is_hip:
+    # AMD: self-implemented hipGraphConditionalHandle equivalent
+    # Reads nsolving back to CPU after each iteration (~2µs with stream sync),
+    # exits when all worlds have converged. No ROCm API change needed.
+    # Equivalent to CUDA conditional graph node early-exit behavior.
+    if not hasattr(d, "_nsolving_host"):
+      d._nsolving_host = wp.empty(1, dtype=int, device="cpu", pinned=True)
+    _dev = wp.get_device()
+    for _ in range(m.opt.iterations):
+      _solver_iteration(m, d, ctx, step_size_cost, nsolving)
+      wp.copy(d._nsolving_host, nsolving)
+      wp.synchronize_stream(_dev)  # stream-scoped sync: ~2µs vs device sync: ~7µs
+      if d._nsolving_host.numpy()[0] == 0:
+        break  # all worlds converged — exit early
   else:
-    # This branch is mostly for when JAX is used as it is currently not compatible
-    # with CUDA graph conditional.
-    # It should be removed when JAX becomes compatible.
     for _ in range(m.opt.iterations):
       _solver_iteration(m, d, ctx, step_size_cost, nsolving)
 
