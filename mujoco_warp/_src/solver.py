@@ -3487,6 +3487,18 @@ def _solve_islands(m: types.Model, d: types.Data, ctx: IslandSolverContext):
       ctx=ctx,
       nsolving=nsolving,
     )
+  elif m.opt.iterations != 0 and wp.get_device().is_hip:
+    # AMD: self-implemented hipGraphConditionalHandle equivalent for island solver.
+    # Same early-exit as monolithic solver — exits when all islands converged.
+    if not hasattr(d, "_nsolving_host_island"):
+      d._nsolving_host_island = wp.empty(1, dtype=int, device="cpu", pinned=True)
+    _dev = wp.get_device()
+    for _ in range(m.opt.iterations):
+      _solver_iteration_island(m, d, ctx, nsolving)
+      wp.copy(d._nsolving_host_island, nsolving)
+      wp.synchronize_stream(_dev)  # stream-scoped sync: ~2µs
+      if d._nsolving_host_island.numpy()[0] == 0:
+        break  # all islands converged — exit early
   else:
     for _ in range(m.opt.iterations):
       _solver_iteration_island(m, d, ctx, nsolving)
