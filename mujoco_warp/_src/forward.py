@@ -653,17 +653,44 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize interia matrix.
   """
+  # Stage 1: kinematics — must complete before both collision and other work
   smooth.kinematics(m, d)
   smooth.com_pos(m, d)
-  smooth.camlight(m, d)
-  smooth.flex(m, d)
-  smooth.tendon(m, d)
-  smooth.crb(m, d)
-  smooth.tendon_armature(m, d)
-  if factorize:
-    smooth.factor_m(m, d)
-  if m.opt.run_collision_detection:
-    collision_driver.collision(m, d)
+
+  # Stage 2: AMD multi-stream optimization — run collision and independent kernels in parallel
+  # Collision reads geom_xpos/xmat (written by kinematics above) — safe to start now.
+  # camlight, flex, tendon, crb, factor_m are independent of collision results.
+  # make_constraint needs both collision output AND M from factor_m — sync before it.
+  device = wp.get_device()
+  if device.is_hip and m.opt.run_collision_detection:
+    # Stream A: collision detection (depends only on geom_xpos from kinematics)
+    stream_a = wp.Stream(device)
+    # Stream B: mass matrix and remaining kinematics-derived work
+    stream_b = wp.Stream(device)
+    with wp.ScopedStream(stream_a):
+      collision_driver.collision(m, d)
+    with wp.ScopedStream(stream_b):
+      smooth.camlight(m, d)
+      smooth.flex(m, d)
+      smooth.tendon(m, d)
+      smooth.crb(m, d)
+      smooth.tendon_armature(m, d)
+      if factorize:
+        smooth.factor_m(m, d)
+    # Sync both streams before make_constraint (needs collision output + M from factor_m)
+    wp.synchronize_stream(stream_a)
+    wp.synchronize_stream(stream_b)
+  else:
+    # CUDA or no collision: sequential path unchanged
+    smooth.camlight(m, d)
+    smooth.flex(m, d)
+    smooth.tendon(m, d)
+    smooth.crb(m, d)
+    smooth.tendon_armature(m, d)
+    if factorize:
+      smooth.factor_m(m, d)
+    if m.opt.run_collision_detection:
+      collision_driver.collision(m, d)
   constraint.make_constraint(m, d)
   if m.ntree > 1 and not (m.opt.disableflags & types.DisableBit.ISLAND):
     island.island(m, d)

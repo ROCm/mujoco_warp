@@ -34,8 +34,8 @@ MJ_MAX_EPAHORIZON = 24
 # maximum average number of trianglarfaces EPA can insert at each iteration
 MJ_MAX_EPAFACES = 5
 
-TILE_SIZE_JTDAJ_SPARSE = 16
-TILE_SIZE_JTDAJ_DENSE = 16
+TILE_SIZE_JTDAJ_SPARSE = 32  # upgraded from 16: uses MFMA_F32_32x32x2 on AMD (4x throughput)
+TILE_SIZE_JTDAJ_DENSE = 32   # upgraded from 16: uses MFMA_F32_32x32x2 on AMD (4x throughput)
 
 # maximum number of plugin attributes
 _NPLUGINATTR = 128
