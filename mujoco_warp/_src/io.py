@@ -1434,6 +1434,16 @@ def put_data(
 
   d.nacon = wp.array([mjd.ncon * nworld], dtype=int)
 
+  # AMD Opt 1/2: Pre-create streams for multi-stream parallelism.
+  # Creating wp.Stream() inside the step loop costs ~10-50µs per call.
+  # Pre-creating and caching here eliminates that per-step overhead.
+  import warp as wp_inner
+  device = wp_inner.get_device()
+  if device.is_hip:
+    d._stream_collision = wp_inner.Stream(device)   # for collision detection
+    d._stream_secondary = wp_inner.Stream(device)   # for independent kinematics work
+    d._stream_cg = wp_inner.Stream(device)          # for CG prev_grad update
+
   return d
 
 

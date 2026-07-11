@@ -655,15 +655,39 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   """
   smooth.kinematics(m, d)
   smooth.com_pos(m, d)
-  smooth.camlight(m, d)
-  smooth.flex(m, d)
-  smooth.tendon(m, d)
-  smooth.crb(m, d)
-  smooth.tendon_armature(m, d)
-  if factorize:
-    smooth.factor_m(m, d)
-  if m.opt.run_collision_detection:
-    collision_driver.collision(m, d)
+
+  # AMD Opt 1: Multi-stream parallelism using pre-cached streams from put_data().
+  # After kinematics+com_pos, collision and independent work can run concurrently.
+  # Streams are pre-created in put_data() to avoid per-step allocation overhead.
+  if (m.opt.run_collision_detection and
+      hasattr(d, '_stream_collision') and
+      hasattr(d, '_stream_secondary')):
+    # Stream A: collision (reads geom_xpos written by kinematics — safe now)
+    with wp.ScopedStream(d._stream_collision):
+      collision_driver.collision(m, d)
+    # Stream B: mass matrix and remaining kinematics work (independent of collision)
+    with wp.ScopedStream(d._stream_secondary):
+      smooth.camlight(m, d)
+      smooth.flex(m, d)
+      smooth.tendon(m, d)
+      smooth.crb(m, d)
+      smooth.tendon_armature(m, d)
+      if factorize:
+        smooth.factor_m(m, d)
+    # Sync both before make_constraint (needs collision output + M from factor_m)
+    wp.synchronize_stream(d._stream_collision)
+    wp.synchronize_stream(d._stream_secondary)
+  else:
+    # Non-AMD or streams not initialized: sequential path
+    smooth.camlight(m, d)
+    smooth.flex(m, d)
+    smooth.tendon(m, d)
+    smooth.crb(m, d)
+    smooth.tendon_armature(m, d)
+    if factorize:
+      smooth.factor_m(m, d)
+    if m.opt.run_collision_detection:
+      collision_driver.collision(m, d)
   constraint.make_constraint(m, d)
   if m.ntree > 1 and not (m.opt.disableflags & types.DisableBit.ISLAND):
     island.island(m, d)
