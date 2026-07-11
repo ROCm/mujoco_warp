@@ -794,29 +794,10 @@ def collision(m: Model, d: Data):
   # zero counters
   wp.launch(_zero_nacon_ncollision, dim=1, outputs=[d.nacon, d.ncollision])
 
-  # AMD Opt 5: Static BVH pair caching
-  # World-anchored geoms (body_weldid==0, no mocap) never move — their broadphase pairs
-  # are constant across steps. Cache the collision context on first call and reuse it.
-  # This avoids re-running broadphase for static-vs-static pairs on subsequent steps.
-  _run_broadphase = True
-  if wp.get_device().is_hip and hasattr(d, "_static_collision_ctx"):
-    # Check if static cache is still valid (no model changes)
-    if getattr(d, "_static_cache_valid", False):
-      ctx = d._static_collision_ctx
-      _run_broadphase = False
-
-  if _run_broadphase:
-    if m.opt.broadphase == BroadphaseType.NXN:
-      nxn_broadphase(m, d, ctx)
-    else:
-      sap_broadphase(m, d, ctx)
-    # Cache for next step on AMD if any geoms exist
-    if wp.get_device().is_hip:
-      d._static_collision_ctx = ctx
-      d._static_cache_valid = True
+  if m.opt.broadphase == BroadphaseType.NXN:
+    nxn_broadphase(m, d, ctx)
   else:
-    # Reuse cached broadphase, but must still zero nacon/ncollision before narrowphase
-    pass
+    sap_broadphase(m, d, ctx)
 
   _narrowphase(m, d, ctx)
 

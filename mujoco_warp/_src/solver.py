@@ -3276,32 +3276,18 @@ def _solver_iteration(
   if incremental:
     ctx.changed_efc_count.zero_()
 
-  # AMD Opt 2: Overlap CG prev_grad update with constraint update.
-  # solve_prev_grad_Mgrad reads ctx.grad/Mgrad (not Jaref) — independent of
-  # _update_constraint which reads Jaref written by linesearch above.
-  device = wp.get_device()
-  if device.is_hip and m.opt.solver == types.SolverType.CG:
-    stream_cg = wp.Stream(device)
-    with wp.ScopedStream(stream_cg):
-      wp.launch(
-        solve_prev_grad_Mgrad,
-        dim=(d.nworld, m.nv),
-        inputs=[ctx.grad, ctx.Mgrad, ctx.done],
-        outputs=[ctx.prev_grad, ctx.prev_Mgrad],
-      )
-    # Default stream: constraint update (reads Jaref from linesearch)
-    _update_constraint(m, d, ctx, track_changes=incremental)
-    wp.synchronize_stream(stream_cg)  # sync before solve_beta needs prev_grad
-  else:
-    if m.opt.solver == types.SolverType.CG:
-      wp.launch(
-        solve_prev_grad_Mgrad,
-        dim=(d.nworld, m.nv),
-        inputs=[ctx.grad, ctx.Mgrad, ctx.done],
-        outputs=[ctx.prev_grad, ctx.prev_Mgrad],
-      )
-    # Incremental H is only valid for non-elliptic cones.
-    _update_constraint(m, d, ctx, track_changes=incremental)
+  if m.opt.solver == types.SolverType.CG:
+    wp.launch(
+      solve_prev_grad_Mgrad,
+      dim=(d.nworld, m.nv),
+      inputs=[ctx.grad, ctx.Mgrad, ctx.done],
+      outputs=[ctx.prev_grad, ctx.prev_Mgrad],
+    )
+  # Incremental H is only valid for non-elliptic cones. The elliptic cone
+  # path in update_constraint_efc has early returns that skip state change
+  # tracking, and the additional JTCJ Hessian term depends on Jaref which
+  # changes every iteration.
+  _update_constraint(m, d, ctx, track_changes=incremental)
 
   if incremental:
     _update_gradient_incremental(m, d, ctx)
