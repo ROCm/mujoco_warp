@@ -1359,12 +1359,7 @@ def _step_body(m: Model, d: Data):
 
 
 def _hip_graph_capture_disabled(m: Model, d: Data) -> bool:
-  """Returns True if hipGraph capture is not possible for this configuration.
-
-  Graph capture is disabled when user callbacks are registered (they may do
-  arbitrary Python and cannot be recorded into a static graph), or when RK4
-  is used (it allocates temporaries inside the loop that vary per step).
-  """
+  """Returns True if hipGraph capture is not possible for this configuration."""
   if m.callback.control or m.callback.act_dyn or m.callback.act_gain or m.callback.act_bias:
     return True
   if m.opt.integrator == IntegratorType.RK4:
@@ -1372,47 +1367,114 @@ def _hip_graph_capture_disabled(m: Model, d: Data) -> bool:
   return False
 
 
+def _hip_graph_zero_scratch(d: Data) -> None:
+  """Zero all AMD pre-allocated scratch buffers before graph capture.
+
+  Mirrors MIGraphX zero_scratch_for(): anchors the captured kernel sequence
+  to a known memory baseline so the first post-capture replay is correct.
+  """
+  for attr in [
+      '_scratch_ten_Jdot', '_scratch_ten_bias_coef', '_scratch_ten_actfrc',
+      '_scratch_ne_connect', '_scratch_ne_weld', '_scratch_moment_nnz',
+      '_scratch_ncon_trnbody',
+  ]:
+    if hasattr(d, attr):
+      buf = getattr(d, attr)
+      if buf is not None:
+        try:
+          buf.zero_()
+        except Exception:
+          pass
+
+
+def _hip_graph_step_single_stream(m: Model, d: Data) -> None:
+  """Run _step_body with multi-stream disabled (for graph capture).
+
+  hipStreamBeginCapture(hipStreamCaptureModeThreadLocal) only captures
+  the default stream. Secondary AMD streams (_stream_collision etc.) would
+  be missed. We temporarily disable them so all work goes through the
+  default stream and gets baked into the graph.
+  """
+  # Temporarily hide the secondary streams so forward.py uses the default path
+  saved = {}
+  for attr in ('_stream_collision', '_stream_secondary', '_stream_cg', '_stream_obs'):
+    if hasattr(d, attr):
+      saved[attr] = getattr(d, attr)
+      delattr(d, attr)
+  try:
+    _step_body(m, d)
+  finally:
+    for attr, val in saved.items():
+      setattr(d, attr, val)
+
+
+# MIGraphX-pattern constants (matches add_hip_graph branch)
+_HIP_GRAPH_PRE_CAPTURE_WARMUP  = 2   # finalize lazy allocs
+_HIP_GRAPH_POST_CAPTURE_WARMUP = 10  # settle internal state before first replay
+
+
 @event_scope
 def step(m: Model, d: Data):
   """Advance simulation.
 
-  AMD Opt D: On AMD/HIP devices, after a configurable number of warmup steps
-  the full step() body is captured as a HIP graph and replayed on subsequent
-  calls.  This amortises per-kernel-launch overhead (~10-50 µs x 100+ kernels
-  per step) with a single graph-replay call.
+  AMD Opt D (MIGraphX-pattern hipGraph): On AMD/HIP devices with
+  WP_HIP_GRAPH_ENABLE=1, captures the full physics step as a hipGraph
+  after warmup and replays it with a single hipGraphLaunch call.
 
-  Graph capture is skipped when user callbacks are registered or when RK4 is
-  used (both require dynamic Python logic that cannot be recorded).
+  Protocol mirrors ROCm/onnxruntime add_hip_graph branch:
+  1. Pre-capture warmup  (2 iters)  — finalise lazy MIGraphX/Warp allocs
+  2. Zero all scratch buffers       — anchor capture to known baseline
+  3. hipStreamBeginCapture          — single-stream mode (multi-stream disabled)
+  4. Post-capture warmup (10 iters) — settle internal state
+  5. hipGraphLaunch on all subsequent steps
 
-  To invalidate the cached graph (e.g., after changing xfrc_applied or
-  eq_active mid-episode), set d._hip_graph = None.
+  Pointer stability: all arrays used inside the graph were pre-allocated by
+  put_data() (AMD Opt A). If d._hip_graph is set to None the graph is
+  re-captured on the next step.
   """
   # ------------------------------------------------------------------ AMD Opt D
-  # Check if we should use hipGraph replay
   _use_graph = (
-    hasattr(d, '_hip_graph')              # put_data() set this (AMD device only)
+    hasattr(d, '_hip_graph')
     and not _hip_graph_capture_disabled(m, d)
   )
 
   if _use_graph:
-    warmup_done = d._hip_step_warmup_count >= d._HIP_GRAPH_WARMUP_STEPS
-
-    if not warmup_done:
-      # Still in warmup: run normally and count
-      _step_body(m, d)
+    # Phase 1: pre-capture warmup to finalise lazy allocations
+    if d._hip_step_warmup_count < _HIP_GRAPH_PRE_CAPTURE_WARMUP:
+      _hip_graph_step_single_stream(m, d)
       d._hip_step_warmup_count += 1
       return
 
+    # Phase 2: capture
     if d._hip_graph is None:
-      # First real step after warmup: capture the graph
-      with wp.ScopedCapture() as capture:
+      import warp as _wp
+      device = _wp.get_device()
+      # Zero all scratch before capture (MIGraphX: zero_scratch_for)
+      _hip_graph_zero_scratch(d)
+      _wp.synchronize_device(device)
+      # Capture on default stream, single-stream mode
+      _wp.capture_begin(device, force_module_load=False)
+      _hip_graph_step_single_stream(m, d)
+      d._hip_graph = _wp.capture_end(device)
+      if d._hip_graph is None:
+        # Capture failed — fall back to normal execution permanently
+        d._hip_step_warmup_count = -1  # sentinel: skip graph path
         _step_body(m, d)
-      d._hip_graph = capture.graph
-      wp.launch_tiled  # warm compile path (no-op)
+        return
+      # Post-capture warmup: settle internal state (MIGraphX: post_warmin loop)
+      for _ in range(_HIP_GRAPH_POST_CAPTURE_WARMUP):
+        _hip_graph_zero_scratch(d)
+        _wp.capture_launch(d._hip_graph)
+      _wp.synchronize_device(device)
       return
 
-    # Graph already captured: replay it
-    wp.capture_launch(d._hip_graph)
+    # Phase 3: steady state — single hipGraphLaunch per step
+    if d._hip_step_warmup_count == -1:
+      # Graph capture failed; run normally
+      _step_body(m, d)
+      return
+    import warp as _wp
+    _wp.capture_launch(d._hip_graph)
     return
   # ------------------------------------------------------------------ end Opt D
 
