@@ -1461,6 +1461,16 @@ def step(m: Model, d: Data):
         d._hip_step_warmup_count = -1  # sentinel: skip graph path
         _step_body(m, d)
         return
+      # Record pointer fingerprint for drift detection
+      for attr in ("_scratch_ten_Jdot", "qpos", "qvel"):
+        if hasattr(d, attr):
+          buf = getattr(d, attr)
+          if buf is not None:
+            try:
+              d._hip_graph_scratch_ptr = buf.ptr
+            except Exception:
+              pass
+            break
       # Post-capture warmup: settle internal state (MIGraphX: post_warmin loop)
       for _ in range(_HIP_GRAPH_POST_CAPTURE_WARMUP):
         _hip_graph_zero_scratch(d)
@@ -1473,6 +1483,28 @@ def step(m: Model, d: Data):
       # Graph capture failed; run normally
       _step_body(m, d)
       return
+
+    # Pointer drift detection (mirrors MIGraphX captured_scratch_ptr check):
+    # if any pre-allocated scratch buffer was reallocated, re-capture the graph.
+    # This can happen if put_data() is called again or arrays are resized.
+    if hasattr(d, "_hip_graph_scratch_ptr"):
+      current_ptr = None
+      for attr in ("_scratch_ten_Jdot", "qpos", "qvel"):
+        if hasattr(d, attr):
+          buf = getattr(d, attr)
+          if buf is not None:
+            try:
+              current_ptr = buf.ptr
+            except Exception:
+              pass
+            break
+      if current_ptr != d._hip_graph_scratch_ptr:
+        # Pointer changed — invalidate graph and re-capture next step
+        d._hip_graph = None
+        d._hip_step_warmup_count = 0
+        _step_body(m, d)
+        return
+
     import warp as _wp
     _wp.capture_launch(d._hip_graph)
     return
