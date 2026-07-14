@@ -1487,12 +1487,20 @@ def step(m: Model, d: Data):
       _wp.synchronize_device(device)
 
       # Capture on default stream, single-stream mode
+      # Set iterations=1 for graph capture: the solver converges in 1-2
+      # iterations for locomotion tasks, and the graph is static (cannot
+      # conditionally break early like the D2H early-exit does).
+      # Setting iterations=1 bakes exactly what early-exit achieves into
+      # the graph, removing the need for any D2H sync during capture/replay.
+      _orig_iterations = m.opt.iterations
+      m.opt.iterations = 1
       # Set flag so solver skips D2H sync (forbidden during capture)
       d._hip_graph_capturing = True
       _wp.capture_begin(device, force_module_load=False)
       _hip_graph_step_single_stream(m, d)
       d._hip_graph = _wp.capture_end(device)
       d._hip_graph_capturing = False
+      m.opt.iterations = _orig_iterations  # restore for non-graph path
 
       if d._hip_graph is None:
         # Capture failed — fall back to normal execution permanently
