@@ -1368,33 +1368,16 @@ def _hip_graph_capture_disabled(m: Model, d: Data) -> bool:
 
 
 def _hip_graph_zero_scratch(d: Data) -> None:
-  """Zero scratch and physics output arrays before/between graph captures.
+  """Zero AMD pre-allocated scratch arrays before graph capture.
 
-  Mirrors coalesce_io_debug fix: zero BOTH scratch arrays AND physics output
-  arrays (qfrc_applied, xfrc_applied, etc.) to anchor the capture to a known
-  baseline. The bug in add_hip_graph was that warmup runs dirty these arrays,
-  so zeroing only before warmup is insufficient — must also re-zero right
-  before hipStreamBeginCapture to flush the warmup dirt.
+  Only zeros the scratch arrays we explicitly pre-allocated in put_data()
+  (AMD Opt A). Physics output arrays (qfrc_smooth etc.) are NOT zeroed here
+  — they are written fresh each step by the solver.
   """
-  # Scratch arrays pre-allocated by put_data() AMD Opt A
   for attr in [
       '_scratch_ten_Jdot', '_scratch_ten_bias_coef', '_scratch_ten_actfrc',
       '_scratch_ne_connect', '_scratch_ne_weld', '_scratch_moment_nnz',
       '_scratch_ncon_trnbody',
-  ]:
-    if hasattr(d, attr):
-      buf = getattr(d, attr)
-      if buf is not None:
-        try:
-          buf.zero_()
-        except Exception:
-          pass
-
-  # Physics output arrays that may be read-before-write in captured kernels
-  # (mirrors coalesce_io_debug: pio.outputs zero before capture AND each post-warmup iter)
-  for attr in [
-      'qfrc_smooth', 'qfrc_constraint', 'qfrc_applied',
-      'xfrc_applied', 'efc_force', 'cacc', 'cfrc_int', 'cfrc_ext',
   ]:
     if hasattr(d, attr):
       buf = getattr(d, attr)
@@ -1556,14 +1539,20 @@ def step(m: Model, d: Data):
     if not hasattr(d, "_nsolving_host"):
       d._nsolving_host = _wp.empty(1, dtype=int, device="cpu", pinned=True)
 
+    # Adaptive dispatch: launch G1 first, check convergence, escalate if needed.
+    # nsolving is tracked via d._nsolving_host (pre-allocated in solver early-exit).
+    # If _nsolving_host not available (e.g. first step), run G1 only as safe default.
     for n_iters in _HIP_GRAPH_ITER_SEQUENCE:
       _wp.capture_launch(graphs[n_iters])
-      if hasattr(d, "nsolving"):
-        # D2H convergence check (~5us): copy nsolving count to pinned CPU memory
-        _wp.copy(d._nsolving_host, d.nsolving)
+      # D2H convergence check: solver writes to d._nsolving_host via early-exit path
+      # If it shows 0 (all worlds converged), stop launching more graphs.
+      if hasattr(d, "_nsolving_host") and d._nsolving_host is not None:
         _wp.synchronize_device()
         if d._nsolving_host.numpy()[0] == 0:
           break  # converged — skip remaining graphs
+      else:
+        # No convergence info available yet — run G1 only, rely on fixed 1 iter
+        break
     return
   # ------------------------------------------------------------------ end Opt D
 
