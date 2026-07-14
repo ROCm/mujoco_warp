@@ -1444,6 +1444,41 @@ def put_data(
     d._stream_secondary = wp_inner.Stream(device)   # for independent kinematics work
     d._stream_cg = wp_inner.Stream(device)          # for CG prev_grad update
 
+  # AMD Opt A: Pre-allocate scratch buffers to eliminate wp.zeros() each step.
+  # These replace inline allocations in tendon_bias, rne_postconstraint,
+  # transmission, and fwd_actuation. Buffers are zeroed via .zero_() before use.
+  # Use actual nJten from model if available (sparse tendon Jacobian nnz)
+  _nJten = int(getattr(mjm, 'nJten', mjm.nv * mjm.ntendon)) if mjm.ntendon > 0 else 1
+  if mjm.ntendon > 0:
+    d._scratch_ten_Jdot = wp.zeros((nworld, _nJten), dtype=float)
+    d._scratch_ten_bias_coef = wp.zeros((nworld, mjm.ntendon), dtype=float)
+    d._scratch_ten_actfrc = wp.zeros((nworld, mjm.ntendon), dtype=float)
+  if mjm.neq > 0:
+    d._scratch_ne_connect = wp.zeros((nworld,), dtype=int)
+    d._scratch_ne_weld = wp.zeros((nworld,), dtype=int)
+  d._scratch_moment_nnz = wp.zeros((nworld,), dtype=int)
+  if getattr(mjm, 'nacttrnbody', 0) > 0:
+    d._scratch_ncon_trnbody = wp.zeros((nworld, mjm.nacttrnbody), dtype=int)
+
+  # AMD Opt D: hipGraph capture of full step().
+  # On AMD devices, after 3 warmup calls we capture one step() as a CUDA/HIP graph
+  # and replay it every subsequent step. Graph capture amortises per-kernel launch
+  # overhead (~10-50µs per launch x 100+ launches/step on AMD).
+  #
+  # Usage contract:
+  #   - The graph is captured the first time _hip_graph_step_fn() is called after
+  #     _hip_step_warmup_count reaches _HIP_GRAPH_WARMUP_STEPS.
+  #   - Capture assumes that qpos/qvel/ctrl/act are the only inputs that change
+  #     between steps. If xfrc_applied or eq_active are modified, call
+  #     d._hip_graph_invalidate() to force re-capture.
+  #   - Callbacks (control, act_dyn, act_gain, act_bias) disable graph capture
+  #     automatically (checked in forward.py before replay).
+  if device.is_hip:
+    d._hip_graph = None           # captured wp.Graph object, None until captured
+    d._hip_graph_exec = None      # compiled graph executable
+    d._hip_step_warmup_count = 0  # counts warmup steps before capture
+    d._HIP_GRAPH_WARMUP_STEPS = 3 # number of warmup steps before capture
+
   return d
 
 

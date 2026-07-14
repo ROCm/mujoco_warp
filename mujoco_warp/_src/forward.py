@@ -1221,7 +1221,12 @@ def fwd_actuation(m: Model, d: Data):
 
   if m.ntendon:
     # total actuator force at tendon
-    ten_actfrc = wp.zeros((d.nworld, m.ntendon), dtype=float)
+    # AMD Opt A: reuse pre-allocated scratch buffer instead of wp.zeros() each step
+    if hasattr(d, '_scratch_ten_actfrc') and d._scratch_ten_actfrc.shape == (d.nworld, m.ntendon):
+      ten_actfrc = d._scratch_ten_actfrc
+      ten_actfrc.zero_()
+    else:
+      ten_actfrc = wp.zeros((d.nworld, m.ntendon), dtype=float)
     wp.launch(
       _tendon_actuator_force,
       dim=(d.nworld, m.nu),
@@ -1339,9 +1344,8 @@ def forward(m: Model, d: Data):
   sensor.sensor_acc(m, d)
 
 
-@event_scope
-def step(m: Model, d: Data):
-  """Advance simulation."""
+def _step_body(m: Model, d: Data):
+  """Core step logic — separated for hipGraph capture."""
   forward(m, d)
 
   if m.opt.integrator == IntegratorType.EULER:
@@ -1352,6 +1356,67 @@ def step(m: Model, d: Data):
     implicit(m, d)
   else:
     raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
+
+
+def _hip_graph_capture_disabled(m: Model, d: Data) -> bool:
+  """Returns True if hipGraph capture is not possible for this configuration.
+
+  Graph capture is disabled when user callbacks are registered (they may do
+  arbitrary Python and cannot be recorded into a static graph), or when RK4
+  is used (it allocates temporaries inside the loop that vary per step).
+  """
+  if m.callback.control or m.callback.act_dyn or m.callback.act_gain or m.callback.act_bias:
+    return True
+  if m.opt.integrator == IntegratorType.RK4:
+    return True
+  return False
+
+
+@event_scope
+def step(m: Model, d: Data):
+  """Advance simulation.
+
+  AMD Opt D: On AMD/HIP devices, after a configurable number of warmup steps
+  the full step() body is captured as a HIP graph and replayed on subsequent
+  calls.  This amortises per-kernel-launch overhead (~10-50 µs x 100+ kernels
+  per step) with a single graph-replay call.
+
+  Graph capture is skipped when user callbacks are registered or when RK4 is
+  used (both require dynamic Python logic that cannot be recorded).
+
+  To invalidate the cached graph (e.g., after changing xfrc_applied or
+  eq_active mid-episode), set d._hip_graph = None.
+  """
+  # ------------------------------------------------------------------ AMD Opt D
+  # Check if we should use hipGraph replay
+  _use_graph = (
+    hasattr(d, '_hip_graph')              # put_data() set this (AMD device only)
+    and not _hip_graph_capture_disabled(m, d)
+  )
+
+  if _use_graph:
+    warmup_done = d._hip_step_warmup_count >= d._HIP_GRAPH_WARMUP_STEPS
+
+    if not warmup_done:
+      # Still in warmup: run normally and count
+      _step_body(m, d)
+      d._hip_step_warmup_count += 1
+      return
+
+    if d._hip_graph is None:
+      # First real step after warmup: capture the graph
+      with wp.ScopedCapture() as capture:
+        _step_body(m, d)
+      d._hip_graph = capture.graph
+      wp.launch_tiled  # warm compile path (no-op)
+      return
+
+    # Graph already captured: replay it
+    wp.capture_launch(d._hip_graph)
+    return
+  # ------------------------------------------------------------------ end Opt D
+
+  _step_body(m, d)
 
 
 @event_scope
