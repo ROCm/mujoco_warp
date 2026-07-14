@@ -3292,7 +3292,8 @@ def _solver_iteration(
     # Default stream: constraint update (reads Jaref from linesearch)
     # Incremental H is only valid for non-elliptic cones.
     _update_constraint(m, d, ctx, track_changes=incremental)
-    wp.synchronize_stream(d._stream_cg)  # sync before solve_beta needs prev_grad
+    if not getattr(d, "_hip_graph_capturing", False) and hasattr(d, "_stream_cg"):
+      wp.synchronize_stream(d._stream_cg)  # sync before solve_beta needs prev_grad
   else:
     if m.opt.solver == types.SolverType.CG:
       wp.launch(
@@ -3445,9 +3446,11 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
     if not hasattr(d, "_nsolving_host"):
       d._nsolving_host = wp.empty(1, dtype=int, device="cpu", pinned=True)
     _dev = wp.get_device()
+    # AMD: skip D2H sync during hipGraph capture (synchronize_stream forbidden)
+    _in_capture = getattr(d, "_hip_graph_capturing", False)
     for i in range(m.opt.iterations):
       _solver_iteration(m, d, ctx, step_size_cost, nsolving)
-      if (i + 1) % N_CHECK == 0:
+      if not _in_capture and (i + 1) % N_CHECK == 0:
         wp.copy(d._nsolving_host, nsolving)
         wp.synchronize_stream(_dev)  # stream-scoped sync: ~2µs
         if d._nsolving_host.numpy()[0] == 0:
@@ -3515,7 +3518,7 @@ def _solve_islands(m: types.Model, d: types.Data, ctx: IslandSolverContext):
     _dev = wp.get_device()
     for i in range(m.opt.iterations):
       _solver_iteration_island(m, d, ctx, nsolving)
-      if (i + 1) % N_CHECK == 0:
+      if not getattr(d, "_hip_graph_capturing", False) and (i + 1) % N_CHECK == 0:
         wp.copy(d._nsolving_host_island, nsolving)
         wp.synchronize_stream(_dev)  # stream-scoped sync: ~2µs
         if d._nsolving_host_island.numpy()[0] == 0:
