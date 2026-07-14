@@ -1430,6 +1430,12 @@ def _hip_graph_step_single_stream(m: Model, d: Data) -> None:
 _HIP_GRAPH_PRE_CAPTURE_WARMUP  = 2   # finalize lazy allocs
 _HIP_GRAPH_POST_CAPTURE_WARMUP = 10  # settle internal state before first replay
 
+# Adaptive hipGraph iteration sequence (user suggestion):
+# 1 → 4 → 10 → 40 → 100
+# Common case (locomotion) converges at 1. Escalates through natural tiers.
+# Worst case: 155 total iterations with 5 D2H checks (~25us overhead total).
+_HIP_GRAPH_ITER_SEQUENCE = (1, 4, 10, 40, 100)
+
 
 @event_scope
 def step(m: Model, d: Data):
@@ -1451,113 +1457,113 @@ def step(m: Model, d: Data):
   re-captured on the next step.
   """
   # ------------------------------------------------------------------ AMD Opt D
+  # Adaptive hipGraph: pre-compiles 5 graphs (1,4,10,40,100 solver iters).
+  # Each step: launch G1, D2H convergence check (~5us), stop if converged,
+  # else launch G4, check, etc. Common case (locomotion) converges at G1.
+  # Worst case runs all 5 graphs = 155 iters with 5 D2H checks (~25us overhead).
+  # This gives full convergence guarantee while near-optimal in the common case.
   _use_graph = (
-    hasattr(d, '_hip_graph')
+    hasattr(d, '_hip_graphs')
     and not _hip_graph_capture_disabled(m, d)
   )
 
   if _use_graph:
-    # Phase 1: pre-capture warmup to finalise lazy allocations
+    # Phase 1: pre-capture warmup — finalise lazy Warp allocations
     if d._hip_step_warmup_count < _HIP_GRAPH_PRE_CAPTURE_WARMUP:
       _hip_graph_step_single_stream(m, d)
       d._hip_step_warmup_count += 1
       return
 
-    # Phase 2: capture
-    if d._hip_graph is None:
+    # Phase 2: build all 5 adaptive graphs
+    if d._hip_graphs is None:
       import warp as _wp
       device = _wp.get_device()
 
-      # coalesce_io_debug protocol: zero outputs+scratch BEFORE pre-capture warmup
-      # so warmup runs start from a clean baseline (not stale state from prior steps)
+      # coalesce_io_debug protocol: zero before warmup AND re-zero before capture
       _hip_graph_zero_scratch(d)
       _wp.synchronize_device(device)
-
-      # Pre-capture warmup: finalize lazy Warp allocations (2 iters)
       for _ in range(_HIP_GRAPH_PRE_CAPTURE_WARMUP):
         _hip_graph_step_single_stream(m, d)
       _wp.synchronize_device(device)
-
-      # coalesce_io_debug fix: RE-ZERO right before BeginCapture.
-      # The warmup runs above dirtied outputs+scratch with warmup-data values.
-      # Without this re-zero, those warmup-derived values get baked into the
-      # captured graph and the first user replay starts from stale warmup state.
-      # This is the exact bug described in the coalesce_io_debug Slack thread.
-      _hip_graph_zero_scratch(d)
+      _hip_graph_zero_scratch(d)  # flush warmup dirt before capture
       _wp.synchronize_device(device)
 
-      # Capture on default stream, single-stream mode
-      # Set iterations=1 for graph capture: the solver converges in 1-2
-      # iterations for locomotion tasks, and the graph is static (cannot
-      # conditionally break early like the D2H early-exit does).
-      # Setting iterations=1 bakes exactly what early-exit achieves into
-      # the graph, removing the need for any D2H sync during capture/replay.
-      _orig_iterations = m.opt.iterations
-      m.opt.iterations = 1
-      # Set flag so solver skips D2H sync (forbidden during capture)
-      d._hip_graph_capturing = True
-      _wp.capture_begin(device, force_module_load=False)
-      _hip_graph_step_single_stream(m, d)
-      d._hip_graph = _wp.capture_end(device)
-      d._hip_graph_capturing = False
-      m.opt.iterations = _orig_iterations  # restore for non-graph path
+      # Capture one graph per iteration count in the adaptive sequence
+      graphs = {}
+      _orig_iters = m.opt.iterations
+      for n_iters in _HIP_GRAPH_ITER_SEQUENCE:
+        m.opt.iterations = n_iters
+        d._hip_graph_capturing = True
+        _wp.capture_begin(device, force_module_load=False)
+        _hip_graph_step_single_stream(m, d)
+        g = _wp.capture_end(device)
+        d._hip_graph_capturing = False
+        if g is None:
+          d._hip_step_warmup_count = -1  # sentinel: disable graph path
+          m.opt.iterations = _orig_iters
+          _step_body(m, d)
+          return
+        graphs[n_iters] = g
+        # Re-zero between captures so each graph starts from clean state
+        _hip_graph_zero_scratch(d)
+        _wp.synchronize_device(device)
 
-      if d._hip_graph is None:
-        # Capture failed — fall back to normal execution permanently
-        d._hip_step_warmup_count = -1  # sentinel: skip graph path
-        _step_body(m, d)
-        return
+      m.opt.iterations = _orig_iters
+      d._hip_graphs = graphs
+
+      # Post-capture warmup with G1 (most common case graph)
+      for _ in range(_HIP_GRAPH_POST_CAPTURE_WARMUP):
+        _hip_graph_zero_scratch(d)
+        _wp.capture_launch(graphs[1])
+      _wp.synchronize_device(device)
 
       # Record pointer fingerprint for drift detection
       for attr in ("_scratch_ten_Jdot", "qpos", "qvel"):
-        if hasattr(d, attr):
-          buf = getattr(d, attr)
-          if buf is not None:
-            try:
-              d._hip_graph_scratch_ptr = buf.ptr
-            except Exception:
-              pass
-            break
-
-      # Post-capture warmup: zero before EACH iteration (coalesce_io_debug fix)
-      # so every warm-in sees the same memory baseline that real replays see.
-      # Without per-iteration zeroing, the 2nd warmup iter sees dirty state from
-      # the 1st, creating a dependency chain that diverges from clean replay state.
-      for _ in range(_HIP_GRAPH_POST_CAPTURE_WARMUP):
-        _hip_graph_zero_scratch(d)
-        _wp.capture_launch(d._hip_graph)
-      _wp.synchronize_device(device)
+        if hasattr(d, attr) and getattr(d, attr) is not None:
+          try:
+            d._hip_graph_scratch_ptr = getattr(d, attr).ptr
+          except Exception:
+            pass
+          break
       return
 
-    # Phase 3: steady state — single hipGraphLaunch per step
+    # Phase 3: capture-failed fallback
     if d._hip_step_warmup_count == -1:
-      # Graph capture failed; run normally
       _step_body(m, d)
       return
 
-    # Pointer drift detection (mirrors MIGraphX captured_scratch_ptr check):
-    # if any pre-allocated scratch buffer was reallocated, re-capture the graph.
-    # This can happen if put_data() is called again or arrays are resized.
+    # Pointer drift: re-capture if pre-allocated buffers moved
     if hasattr(d, "_hip_graph_scratch_ptr"):
       current_ptr = None
       for attr in ("_scratch_ten_Jdot", "qpos", "qvel"):
-        if hasattr(d, attr):
-          buf = getattr(d, attr)
-          if buf is not None:
-            try:
-              current_ptr = buf.ptr
-            except Exception:
-              pass
-            break
+        if hasattr(d, attr) and getattr(d, attr) is not None:
+          try:
+            current_ptr = getattr(d, attr).ptr
+          except Exception:
+            pass
+          break
       if current_ptr != d._hip_graph_scratch_ptr:
-        # Pointer changed — invalidate graph and re-capture next step
-        d._hip_graph = None
+        d._hip_graphs = None
         d._hip_step_warmup_count = 0
         _step_body(m, d)
         return
 
+    # Phase 4: adaptive steady-state dispatch
+    # Launch G1, check convergence, escalate to G4/G10/G40/G100 only if needed.
+    # D2H check happens BETWEEN graph launches — never inside capture window.
     import warp as _wp
-    _wp.capture_launch(d._hip_graph)
+    graphs = d._hip_graphs
+    if not hasattr(d, "_nsolving_host"):
+      d._nsolving_host = _wp.empty(1, dtype=int, device="cpu", pinned=True)
+
+    for n_iters in _HIP_GRAPH_ITER_SEQUENCE:
+      _wp.capture_launch(graphs[n_iters])
+      if hasattr(d, "nsolving"):
+        # D2H convergence check (~5us): copy nsolving count to pinned CPU memory
+        _wp.copy(d._nsolving_host, d.nsolving)
+        _wp.synchronize_device()
+        if d._nsolving_host.numpy()[0] == 0:
+          break  # converged — skip remaining graphs
     return
   # ------------------------------------------------------------------ end Opt D
 

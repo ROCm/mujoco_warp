@@ -1489,7 +1489,7 @@ def put_data(
   #   - Callbacks (control, act_dyn, act_gain, act_bias) disable graph capture
   #     automatically (checked in forward.py before replay).
   if device.is_hip:
-    d._hip_graph = None           # captured wp.Graph object, None until captured
+    d._hip_graphs = None          # dict {n_iters: graph} built on first real step
     d._hip_graph_exec = None      # compiled graph executable
     d._hip_step_warmup_count = 0  # counts warmup steps before capture
     d._HIP_GRAPH_WARMUP_STEPS = 3 # number of warmup steps before capture
