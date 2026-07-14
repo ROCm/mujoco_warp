@@ -1368,15 +1368,33 @@ def _hip_graph_capture_disabled(m: Model, d: Data) -> bool:
 
 
 def _hip_graph_zero_scratch(d: Data) -> None:
-  """Zero all AMD pre-allocated scratch buffers before graph capture.
+  """Zero scratch and physics output arrays before/between graph captures.
 
-  Mirrors MIGraphX zero_scratch_for(): anchors the captured kernel sequence
-  to a known memory baseline so the first post-capture replay is correct.
+  Mirrors coalesce_io_debug fix: zero BOTH scratch arrays AND physics output
+  arrays (qfrc_applied, xfrc_applied, etc.) to anchor the capture to a known
+  baseline. The bug in add_hip_graph was that warmup runs dirty these arrays,
+  so zeroing only before warmup is insufficient — must also re-zero right
+  before hipStreamBeginCapture to flush the warmup dirt.
   """
+  # Scratch arrays pre-allocated by put_data() AMD Opt A
   for attr in [
       '_scratch_ten_Jdot', '_scratch_ten_bias_coef', '_scratch_ten_actfrc',
       '_scratch_ne_connect', '_scratch_ne_weld', '_scratch_moment_nnz',
       '_scratch_ncon_trnbody',
+  ]:
+    if hasattr(d, attr):
+      buf = getattr(d, attr)
+      if buf is not None:
+        try:
+          buf.zero_()
+        except Exception:
+          pass
+
+  # Physics output arrays that may be read-before-write in captured kernels
+  # (mirrors coalesce_io_debug: pio.outputs zero before capture AND each post-warmup iter)
+  for attr in [
+      'qfrc_smooth', 'qfrc_constraint', 'qfrc_applied',
+      'xfrc_applied', 'efc_force', 'cacc', 'cfrc_int', 'cfrc_ext',
   ]:
     if hasattr(d, attr):
       buf = getattr(d, attr)
@@ -1449,18 +1467,36 @@ def step(m: Model, d: Data):
     if d._hip_graph is None:
       import warp as _wp
       device = _wp.get_device()
-      # Zero all scratch before capture (MIGraphX: zero_scratch_for)
+
+      # coalesce_io_debug protocol: zero outputs+scratch BEFORE pre-capture warmup
+      # so warmup runs start from a clean baseline (not stale state from prior steps)
       _hip_graph_zero_scratch(d)
       _wp.synchronize_device(device)
+
+      # Pre-capture warmup: finalize lazy Warp allocations (2 iters)
+      for _ in range(_HIP_GRAPH_PRE_CAPTURE_WARMUP):
+        _hip_graph_step_single_stream(m, d)
+      _wp.synchronize_device(device)
+
+      # coalesce_io_debug fix: RE-ZERO right before BeginCapture.
+      # The warmup runs above dirtied outputs+scratch with warmup-data values.
+      # Without this re-zero, those warmup-derived values get baked into the
+      # captured graph and the first user replay starts from stale warmup state.
+      # This is the exact bug described in the coalesce_io_debug Slack thread.
+      _hip_graph_zero_scratch(d)
+      _wp.synchronize_device(device)
+
       # Capture on default stream, single-stream mode
       _wp.capture_begin(device, force_module_load=False)
       _hip_graph_step_single_stream(m, d)
       d._hip_graph = _wp.capture_end(device)
+
       if d._hip_graph is None:
         # Capture failed — fall back to normal execution permanently
         d._hip_step_warmup_count = -1  # sentinel: skip graph path
         _step_body(m, d)
         return
+
       # Record pointer fingerprint for drift detection
       for attr in ("_scratch_ten_Jdot", "qpos", "qvel"):
         if hasattr(d, attr):
@@ -1471,7 +1507,11 @@ def step(m: Model, d: Data):
             except Exception:
               pass
             break
-      # Post-capture warmup: settle internal state (MIGraphX: post_warmin loop)
+
+      # Post-capture warmup: zero before EACH iteration (coalesce_io_debug fix)
+      # so every warm-in sees the same memory baseline that real replays see.
+      # Without per-iteration zeroing, the 2nd warmup iter sees dirty state from
+      # the 1st, creating a dependency chain that diverges from clean replay state.
       for _ in range(_HIP_GRAPH_POST_CAPTURE_WARMUP):
         _hip_graph_zero_scratch(d)
         _wp.capture_launch(d._hip_graph)
