@@ -1543,7 +1543,7 @@ def rne_postconstraint(m: Model, d: Data):
   if m.neq > 0:
     # Allocate inline counters and count from efc data
     # AMD Opt A: reuse pre-allocated scratch counters instead of wp.zeros() each step
-    if hasattr(d, '_scratch_ne_connect'):
+    if hasattr(d, "_scratch_ne_connect"):
       ne_connect = d._scratch_ne_connect
       ne_weld = d._scratch_ne_weld
       ne_connect.zero_()
@@ -1919,7 +1919,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
   """
   # time derivative of tendon Jacobian
   # AMD Opt A: reuse pre-allocated scratch buffer instead of wp.zeros() each step
-  if hasattr(d, '_scratch_ten_Jdot') and d._scratch_ten_Jdot.shape == (d.nworld, m.nJten):
+  if hasattr(d, "_scratch_ten_Jdot") and d._scratch_ten_Jdot.shape == (d.nworld, m.nJten):
     ten_Jdot = d._scratch_ten_Jdot
     ten_Jdot.zero_()
   else:
@@ -1956,7 +1956,7 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
 
   # tendon bias force coefficients
   # AMD Opt A: reuse pre-allocated scratch buffer instead of wp.zeros() each step
-  if hasattr(d, '_scratch_ten_bias_coef') and d._scratch_ten_bias_coef.shape == (d.nworld, m.ntendon):
+  if hasattr(d, "_scratch_ten_bias_coef") and d._scratch_ten_bias_coef.shape == (d.nworld, m.ntendon):
     ten_bias_coef = d._scratch_ten_bias_coef
     ten_bias_coef.zero_()
   else:
@@ -2696,7 +2696,7 @@ def transmission(m: Model, d: Data):
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
   # AMD Opt A: reuse pre-allocated scratch counter instead of wp.zeros() each step
-  if hasattr(d, '_scratch_moment_nnz'):
+  if hasattr(d, "_scratch_moment_nnz"):
     moment_nnz = d._scratch_moment_nnz
     moment_nnz.zero_()
   else:
@@ -2743,7 +2743,7 @@ def transmission(m: Model, d: Data):
   if m.nacttrnbody:
     # compute moments
     # AMD Opt A: reuse pre-allocated scratch counter instead of wp.zeros() each step
-    if hasattr(d, '_scratch_ncon_trnbody') and d._scratch_ncon_trnbody.shape == (d.nworld, m.nacttrnbody):
+    if hasattr(d, "_scratch_ncon_trnbody") and d._scratch_ncon_trnbody.shape == (d.nworld, m.nacttrnbody):
       ncon = d._scratch_ncon_trnbody
       ncon.zero_()
     else:

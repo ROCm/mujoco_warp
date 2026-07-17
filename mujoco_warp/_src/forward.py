@@ -659,9 +659,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   # AMD Opt 1: Multi-stream parallelism using pre-cached streams from put_data().
   # After kinematics+com_pos, collision and independent work can run concurrently.
   # Streams are pre-created in put_data() to avoid per-step allocation overhead.
-  if (m.opt.run_collision_detection and
-      hasattr(d, '_stream_collision') and
-      hasattr(d, '_stream_secondary')):
+  if m.opt.run_collision_detection and hasattr(d, "_stream_collision") and hasattr(d, "_stream_secondary"):
     # Stream A: collision (reads geom_xpos written by kinematics — safe now)
     with wp.ScopedStream(d._stream_collision):
       collision_driver.collision(m, d)
@@ -1222,7 +1220,7 @@ def fwd_actuation(m: Model, d: Data):
   if m.ntendon:
     # total actuator force at tendon
     # AMD Opt A: reuse pre-allocated scratch buffer instead of wp.zeros() each step
-    if hasattr(d, '_scratch_ten_actfrc') and d._scratch_ten_actfrc.shape == (d.nworld, m.ntendon):
+    if hasattr(d, "_scratch_ten_actfrc") and d._scratch_ten_actfrc.shape == (d.nworld, m.ntendon):
       ten_actfrc = d._scratch_ten_actfrc
       ten_actfrc.zero_()
     else:
@@ -1375,9 +1373,13 @@ def _hip_graph_zero_scratch(d: Data) -> None:
   — they are written fresh each step by the solver.
   """
   for attr in [
-      '_scratch_ten_Jdot', '_scratch_ten_bias_coef', '_scratch_ten_actfrc',
-      '_scratch_ne_connect', '_scratch_ne_weld', '_scratch_moment_nnz',
-      '_scratch_ncon_trnbody',
+    "_scratch_ten_Jdot",
+    "_scratch_ten_bias_coef",
+    "_scratch_ten_actfrc",
+    "_scratch_ne_connect",
+    "_scratch_ne_weld",
+    "_scratch_moment_nnz",
+    "_scratch_ncon_trnbody",
   ]:
     if hasattr(d, attr):
       buf = getattr(d, attr)
@@ -1398,7 +1400,7 @@ def _hip_graph_step_single_stream(m: Model, d: Data) -> None:
   """
   # Temporarily hide the secondary streams so forward.py uses the default path
   saved = {}
-  for attr in ('_stream_collision', '_stream_secondary', '_stream_cg', '_stream_obs'):
+  for attr in ("_stream_collision", "_stream_secondary", "_stream_cg", "_stream_obs"):
     if hasattr(d, attr):
       saved[attr] = getattr(d, attr)
       delattr(d, attr)
@@ -1410,7 +1412,7 @@ def _hip_graph_step_single_stream(m: Model, d: Data) -> None:
 
 
 # MIGraphX-pattern constants (matches add_hip_graph branch)
-_HIP_GRAPH_PRE_CAPTURE_WARMUP  = 2   # finalize lazy allocs
+_HIP_GRAPH_PRE_CAPTURE_WARMUP = 2  # finalize lazy allocs
 _HIP_GRAPH_POST_CAPTURE_WARMUP = 10  # settle internal state before first replay
 
 # Adaptive hipGraph iteration sequence (user suggestion):
@@ -1445,10 +1447,7 @@ def step(m: Model, d: Data):
   # else launch G4, check, etc. Common case (locomotion) converges at G1.
   # Worst case runs all 5 graphs = 155 iters with 5 D2H checks (~25us overhead).
   # This gives full convergence guarantee while near-optimal in the common case.
-  _use_graph = (
-    hasattr(d, '_hip_graphs')
-    and not _hip_graph_capture_disabled(m, d)
-  )
+  _use_graph = hasattr(d, "_hip_graphs") and not _hip_graph_capture_disabled(m, d)
 
   if _use_graph:
     # Phase 1: pre-capture warmup — finalise lazy Warp allocations
@@ -1460,6 +1459,7 @@ def step(m: Model, d: Data):
     # Phase 2: build all 5 adaptive graphs
     if d._hip_graphs is None:
       import warp as _wp
+
       device = _wp.get_device()
 
       # coalesce_io_debug protocol: zero before warmup AND re-zero before capture
@@ -1535,6 +1535,7 @@ def step(m: Model, d: Data):
     # Launch G1, check convergence, escalate to G4/G10/G40/G100 only if needed.
     # D2H check happens BETWEEN graph launches — never inside capture window.
     import warp as _wp
+
     graphs = d._hip_graphs
     if not hasattr(d, "_nsolving_host"):
       d._nsolving_host = _wp.empty(1, dtype=int, device="cpu", pinned=True)

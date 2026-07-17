@@ -35,7 +35,7 @@ MJ_MAX_EPAHORIZON = 24
 MJ_MAX_EPAFACES = 5
 
 TILE_SIZE_JTDAJ_SPARSE = 16  # 16x16 rocWMMA MFMA (32x32 deferred — tile.h support needed)
-TILE_SIZE_JTDAJ_DENSE = 16   # 16x16 rocWMMA MFMA (32x32 deferred — tile.h support needed)
+TILE_SIZE_JTDAJ_DENSE = 16  # 16x16 rocWMMA MFMA (32x32 deferred — tile.h support needed)
 
 # maximum number of plugin attributes
 _NPLUGINATTR = 128

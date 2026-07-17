@@ -3280,8 +3280,7 @@ def _solver_iteration(
   # solve_prev_grad_Mgrad reads ctx.grad/Mgrad (NOT Jaref) — independent of
   # _update_constraint which reads Jaref written by linesearch above.
   # Pre-cached stream avoids per-step wp.Stream() allocation overhead.
-  if (m.opt.solver == types.SolverType.CG and
-      hasattr(d, '_stream_cg')):
+  if m.opt.solver == types.SolverType.CG and hasattr(d, "_stream_cg"):
     with wp.ScopedStream(d._stream_cg):
       wp.launch(
         solve_prev_grad_Mgrad,

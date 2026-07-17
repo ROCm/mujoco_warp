@@ -1446,11 +1446,12 @@ def put_data(
   # Creating wp.Stream() inside the step loop costs ~10-50µs per call.
   # Pre-creating and caching here eliminates that per-step overhead.
   import warp as wp_inner
+
   device = wp_inner.get_device()
   if device.is_hip:
-    d._stream_collision = wp_inner.Stream(device)   # for collision detection
-    d._stream_secondary = wp_inner.Stream(device)   # for independent kinematics work
-    d._stream_cg = wp_inner.Stream(device)          # for CG prev_grad update
+    d._stream_collision = wp_inner.Stream(device)  # for collision detection
+    d._stream_secondary = wp_inner.Stream(device)  # for independent kinematics work
+    d._stream_cg = wp_inner.Stream(device)  # for CG prev_grad update
     # AMD Opt E: dedicated stream for async observation readback.
     # Allows the RL framework to overlap GPU physics (next step) with CPU/NN
     # processing of observations from the current step. Usage:
@@ -1463,7 +1464,7 @@ def put_data(
   # These replace inline allocations in tendon_bias, rne_postconstraint,
   # transmission, and fwd_actuation. Buffers are zeroed via .zero_() before use.
   # Use actual nJten from model if available (sparse tendon Jacobian nnz)
-  _nJten = int(getattr(mjm, 'nJten', mjm.nv * mjm.ntendon)) if mjm.ntendon > 0 else 1
+  _nJten = int(getattr(mjm, "nJten", mjm.nv * mjm.ntendon)) if mjm.ntendon > 0 else 1
   if mjm.ntendon > 0:
     d._scratch_ten_Jdot = wp.zeros((nworld, _nJten), dtype=float)
     d._scratch_ten_bias_coef = wp.zeros((nworld, mjm.ntendon), dtype=float)
@@ -1472,7 +1473,7 @@ def put_data(
     d._scratch_ne_connect = wp.zeros((nworld,), dtype=int)
     d._scratch_ne_weld = wp.zeros((nworld,), dtype=int)
   d._scratch_moment_nnz = wp.zeros((nworld,), dtype=int)
-  if getattr(mjm, 'nacttrnbody', 0) > 0:
+  if getattr(mjm, "nacttrnbody", 0) > 0:
     d._scratch_ncon_trnbody = wp.zeros((nworld, mjm.nacttrnbody), dtype=int)
 
   # AMD Opt D: hipGraph capture of full step().
@@ -1489,10 +1490,10 @@ def put_data(
   #   - Callbacks (control, act_dyn, act_gain, act_bias) disable graph capture
   #     automatically (checked in forward.py before replay).
   if device.is_hip:
-    d._hip_graphs = None          # dict {n_iters: graph} built on first real step
-    d._hip_graph_exec = None      # compiled graph executable
+    d._hip_graphs = None  # dict {n_iters: graph} built on first real step
+    d._hip_graph_exec = None  # compiled graph executable
     d._hip_step_warmup_count = 0  # counts warmup steps before capture
-    d._HIP_GRAPH_WARMUP_STEPS = 3 # number of warmup steps before capture
+    d._HIP_GRAPH_WARMUP_STEPS = 3  # number of warmup steps before capture
 
   return d
 
