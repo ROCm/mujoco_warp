@@ -1447,7 +1447,14 @@ def step(m: Model, d: Data):
   # else launch G4, check, etc. Common case (locomotion) converges at G1.
   # Worst case runs all 5 graphs = 155 iters with 5 D2H checks (~25us overhead).
   # This gives full convergence guarantee while near-optimal in the common case.
-  _use_graph = hasattr(d, "_hip_graphs") and not _hip_graph_capture_disabled(m, d)
+  # Check WP_HIP_GRAPH_ENABLE — without it, capture_begin is a no-op on HIP
+  import os as _os
+  _hip_graph_enabled = _os.environ.get("WP_HIP_GRAPH_ENABLE", "0") == "1"
+  _use_graph = (
+    hasattr(d, "_hip_graphs")
+    and _hip_graph_enabled
+    and not _hip_graph_capture_disabled(m, d)
+  )
 
   if _use_graph:
     # Phase 1: pre-capture warmup — finalise lazy Warp allocations
@@ -1477,9 +1484,24 @@ def step(m: Model, d: Data):
       for n_iters in _HIP_GRAPH_ITER_SEQUENCE:
         m.opt.iterations = n_iters
         d._hip_graph_capturing = True
-        _wp.capture_begin(device, force_module_load=False)
-        _hip_graph_step_single_stream(m, d)
-        g = _wp.capture_end(device)
+        try:
+          began = _wp.capture_begin(device, force_module_load=False)
+          if not began:
+            # capture_begin returned False — HIP graph not supported
+            d._hip_graph_capturing = False
+            d._hip_step_warmup_count = -1
+            m.opt.iterations = _orig_iters
+            _step_body(m, d)
+            return
+          _hip_graph_step_single_stream(m, d)
+          g = _wp.capture_end(device)
+        except Exception as e:
+          d._hip_graph_capturing = False
+          print(f"[AMD hipGraph] capture failed for n_iters={n_iters}: {e}")
+          d._hip_step_warmup_count = -1
+          m.opt.iterations = _orig_iters
+          _step_body(m, d)
+          return
         d._hip_graph_capturing = False
         if g is None:
           d._hip_step_warmup_count = -1  # sentinel: disable graph path
