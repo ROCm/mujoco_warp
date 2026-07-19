@@ -659,7 +659,15 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   # AMD Opt 1: Multi-stream parallelism using pre-cached streams from put_data().
   # After kinematics+com_pos, collision and independent work can run concurrently.
   # Streams are pre-created in put_data() to avoid per-step allocation overhead.
-  if m.opt.run_collision_detection and hasattr(d, "_stream_collision") and hasattr(d, "_stream_secondary"):
+  # AMD PR#5: disable multi-stream when WP_HIP_GRAPH_ENABLE=1
+  # hipGraph (ThreadLocal mode) only captures default stream — secondary streams missed.
+  # hipGraph gain (~40-60%) >> multi-stream gain (~5-10%), so disable multi-stream
+  # when hipGraph is active to allow full step capture on single stream.
+  import os as _fwd_os
+  _hip_graph_mode = _fwd_os.environ.get("WP_HIP_GRAPH_ENABLE", "0") == "1"
+  if (not _hip_graph_mode and
+      m.opt.run_collision_detection and
+      hasattr(d, "_stream_collision") and hasattr(d, "_stream_secondary")):
     # Stream A: collision (reads geom_xpos written by kinematics — safe now)
     with wp.ScopedStream(d._stream_collision):
       collision_driver.collision(m, d)
