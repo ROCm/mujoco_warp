@@ -1487,6 +1487,16 @@ def step(m: Model, d: Data):
       _wp.synchronize_device(device)
 
       # Capture one graph per iteration count in the adaptive sequence
+      # PR#15 disables mempool by default (ROCm memset bug) but graph capture
+      # needs mempool for wp.zeros/wp.empty inside step functions.
+      # Re-enable temporarily for capture only.
+      _mempool_reenabled = False
+      try:
+        _wp.set_mempool_enabled(device, True)
+        _mempool_reenabled = True
+      except Exception:
+        pass
+
       graphs = {}
       _orig_iters = m.opt.iterations
       for n_iters in _HIP_GRAPH_ITER_SEQUENCE:
@@ -1522,6 +1532,12 @@ def step(m: Model, d: Data):
         _wp.synchronize_device(device)
 
       m.opt.iterations = _orig_iters
+      # Restore mempool disabled state after capture
+      if _mempool_reenabled:
+        try:
+          _wp.set_mempool_enabled(device, False)
+        except Exception:
+          pass
       d._hip_graphs = graphs
 
       # Post-capture warmup with G1 (most common case graph)
