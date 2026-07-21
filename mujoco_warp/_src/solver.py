@@ -149,6 +149,41 @@ def create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
   )
 
 
+def _get_cached_solver_context(m: types.Model, d: types.Data) -> SolverContext:
+  """Return a persistent SolverContext cached on ``d``, reused across solves.
+
+  ``create_solver_context`` allocates ~16-24 device arrays on every solve; with
+  the synchronous ROCm allocator each per-step free is a ``hipFree`` that stalls
+  the device (profiling showed ~30% of wall time in per-step frees). Caching the
+  context and reusing it removes those allocations entirely.
+
+  Semantics are preserved exactly: ``create_solver_context`` zero-initializes only
+  grad/Mgrad/h/hfactor (the rest are ``wp.empty`` = uninitialized and overwritten
+  before use each solve). On reuse we re-zero just those four arrays, so the solver
+  sees the same initial state as a freshly allocated context.
+  """
+  nv_pad = m.nv_pad
+  alloc_h = m.opt.solver == types.SolverType.NEWTON
+  alloc_hfactor = alloc_h and m.nv > _BLOCK_CHOLESKY_DIM
+  sig = (d.nworld, m.nv, nv_pad, d.njmax, int(m.opt.solver), alloc_h, alloc_hfactor)
+
+  ctx = getattr(d, "_cached_solver_ctx", None)
+  if ctx is None or getattr(d, "_cached_solver_ctx_sig", None) != sig:
+    ctx = create_solver_context(m, d)
+    d._cached_solver_ctx = ctx
+    d._cached_solver_ctx_sig = sig
+    return ctx
+
+  # Reused context: restore the zero-init invariant.
+  ctx.grad.zero_()
+  ctx.Mgrad.zero_()
+  if alloc_h:
+    ctx.h.zero_()
+  if alloc_hfactor:
+    ctx.hfactor.zero_()
+  return ctx
+
+
 @wp.func
 def _rescale(nv: int, meaninertia: float, value: float) -> float:
   return value / (meaninertia * float(nv))
@@ -3401,7 +3436,7 @@ def solve(m: types.Model, d: types.Data):
       scatter_Ma = m.opt.integrator != types.IntegratorType.RK4
       island.scatter_island_results(m, d, ctx, scatter_Ma=scatter_Ma)
     else:
-      ctx = create_solver_context(m, d)
+      ctx = _get_cached_solver_context(m, d)
       _solve(m, d, ctx)
 
 
