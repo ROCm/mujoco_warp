@@ -19,6 +19,9 @@ import warp as wp
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.batched_cholesky import BATCHED_CHOLESKY_MAX_DIM as _BATCHED_CHOLESKY_MAX_DIM
+from mujoco_warp._src.batched_cholesky import USE_BATCHED_CHOLESKY as _USE_BATCHED_CHOLESKY
+from mujoco_warp._src.batched_cholesky import batched_factor_solve_i
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import CamLightType
@@ -3073,13 +3076,22 @@ def _factor_solve_i_dense(
   L: wp.array3d[float],
 ):
   for tile in m.M_tiles:
-    wp.launch_tiled(
-      _tile_cholesky_factorize_solve(tile),
-      dim=(d.nworld, tile.adr.size),
-      inputs=[M, y, tile.adr],
-      outputs=[x, L],
-      block_dim=m.block_dim.cholesky_factorize_solve,
-    )
+    if _USE_BATCHED_CHOLESKY and tile.size <= _BATCHED_CHOLESKY_MAX_DIM:
+      wp.launch_tiled(
+        batched_factor_solve_i(tile.size),
+        dim=(d.nworld, tile.adr.size),
+        inputs=[M, y, tile.adr],
+        outputs=[x, L],
+        block_dim=64,
+      )
+    else:
+      wp.launch_tiled(
+        _tile_cholesky_factorize_solve(tile),
+        dim=(d.nworld, tile.adr.size),
+        inputs=[M, y, tile.adr],
+        outputs=[x, L],
+        block_dim=m.block_dim.cholesky_factorize_solve,
+      )
 
 
 def factor_solve_i(m, d, M, L, D, x, y):
