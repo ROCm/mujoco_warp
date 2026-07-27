@@ -3125,7 +3125,26 @@ def solve(m: types.Model, d: types.Data):
       scatter_Ma = m.opt.integrator != types.IntegratorType.RK4
       island.scatter_island_results(m, d, ctx, scatter_Ma=scatter_Ma)
     else:
-      ctx = _create_solver_context(m, d)
+      # Cache solver context on Data to avoid repeated allocation.
+      # On HIP/ROCm: allocate with mempool temporarily disabled so buffers use
+      # hipMalloc (stable addresses) not hipMallocAsync.  hipMallocAsync pointers
+      # become memAlloc nodes inside a hipGraph and re-execute on every replay,
+      # adding significant overhead.  On CUDA this path has no effect.
+      if not hasattr(d, '_solver_ctx'):
+        _dev = wp.get_device()
+        if _dev.is_hip and wp.is_mempool_enabled(_dev):
+          wp.set_mempool_enabled(_dev, False)
+          d._solver_ctx = _create_solver_context(m, d)
+          wp.set_mempool_enabled(_dev, True)
+        else:
+          d._solver_ctx = _create_solver_context(m, d)
+      ctx = d._solver_ctx
+      ctx.grad.zero_()
+      ctx.Mgrad.zero_()
+      if ctx.h.shape[0] > 0:
+        ctx.h.zero_()
+      if ctx.hfactor.shape[0] > 0:
+        ctx.hfactor.zero_()
       _solve(m, d, ctx)
 
 
@@ -3167,6 +3186,25 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
     # becomes zero and all worlds are marked as converged to avoid an infinite loop.
     # note: we only launch the iteration kernel if everything is not done
     wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving)
+  elif m.opt.iterations != 0 and wp.get_device().is_hip:
+    # HIP/ROCm: wp.capture_while uses CUDA conditional graph nodes which are
+    # not available on ROCm. Implement equivalent convergence-based early exit
+    # by sampling nsolving every N_CHECK iterations. D2H sync is ~2us;
+    # checking every 3 iterations amortizes cost while catching convergence
+    # within a few extra iterations of the true convergence point.
+    N_CHECK = 3
+    if not hasattr(d, "_nsolving_host"):
+      d._nsolving_host = wp.empty(1, dtype=int, device="cpu", pinned=True)
+    _dev = wp.get_device()
+    # Skip D2H sync during graph capture (synchronize_stream forbidden on HIP).
+    _in_capture = _dev.is_capturing if _dev.is_hip else False
+    for i in range(m.opt.iterations):
+      _solver_iteration(m, d, ctx, nsolving)
+      if not _in_capture and (i + 1) % N_CHECK == 0:
+        wp.copy(d._nsolving_host, nsolving)
+        wp.synchronize_stream(_dev)
+        if d._nsolving_host.numpy()[0] == 0:
+          break  # all worlds converged early
   else:
     # This branch is mostly for when JAX is used as it is currently not compatible
     # with CUDA graph conditional.
