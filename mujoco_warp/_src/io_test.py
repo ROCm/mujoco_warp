@@ -461,11 +461,18 @@ class IOTest(parameterized.TestCase):
     mjm, _, _, d = test_data.fixture("pendula.xml")
     md = mjwarp.make_data(mjm)
 
-    # same number of fields
-    self.assertEqual(len(d.__dict__), len(md.__dict__))
+    # same public fields. put_data may attach private, backend-specific runtime
+    # attributes (e.g. cached streams, scratch buffers, HIP graph state) that
+    # make_data does not; these are not part of the Data array schema, so only
+    # compare non-underscore fields.
+    d_fields = {k for k in d.__dict__ if not k.startswith("_")}
+    md_fields = {k for k in md.__dict__ if not k.startswith("_")}
+    self.assertEqual(d_fields, md_fields)
 
     # test shapes for all arrays
     for attr, val in md.__dict__.items():
+      if attr.startswith("_"):
+        continue
       if isinstance(val, wp.array):
         self.assertEqual(val.shape, getattr(d, attr).shape, f"{attr} shape mismatch")
 

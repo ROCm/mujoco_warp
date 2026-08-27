@@ -46,8 +46,14 @@ from mujoco_warp._src.types import vec8i
 from mujoco_warp._src.types import vec_pluginattr
 from mujoco_warp._src.util_misc import inside_geom
 from mujoco_warp._src.util_misc import poly_potential
+from mujoco_warp._src.util_pkg import check_version
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
+
+# MuJoCo 3.9.0 changed the tactile sensor to report raw penetration depth instead
+# of an estimated pressure (mujoco commit f6cd0234). Match whichever convention
+# the installed MuJoCo uses so results agree with mjData.sensordata.
+_TACTILE_REPORTS_RAW_DEPTH = check_version("mujoco>=3.9.0")
 
 wp.set_module_options({"enable_backward": False})
 
@@ -2261,12 +2267,17 @@ def _sensor_tactile(
     )
     vel_rel = vel_sensor - vel_other
 
-    kMaxDepth = 0.05
-    pressure = depth / wp.max(kMaxDepth - depth, MJ_MINVAL)
-    force = wp.mul(normal, pressure)
-
     forceT = wp.vec3(0.0, 0.0, 0.0)
-    forceT[0] = wp.dot(force, normal)
+    if wp.static(_TACTILE_REPORTS_RAW_DEPTH):
+      # MuJoCo >= 3.9: report raw penetration depth (depth is <= 0 here).
+      forceT[0] = -depth
+    else:
+      # MuJoCo < 3.9: estimated pressure. normal is unit, so dot(force, normal)
+      # reduces to the scalar pressure.
+      kMaxDepth = 0.05
+      pressure = depth / wp.max(kMaxDepth - depth, MJ_MINVAL)
+      force = wp.mul(normal, pressure)
+      forceT[0] = wp.dot(force, normal)
     if has_frame:
       forceT[1] = wp.abs(wp.dot(vel_rel, tang1))
       forceT[2] = wp.abs(wp.dot(vel_rel, tang2))

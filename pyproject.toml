@@ -125,6 +125,32 @@ docstring-code-line-length = 100
 testpaths = ["mujoco_warp"]
 norecursedirs = ["benchmarks", "contrib"]
 
+[tool.coverage.run]
+source = ["mujoco_warp"]
+omit = [
+    "*_test.py",
+    "*/conftest.py",
+    "mujoco_warp/_src/cli.py",
+    "mujoco_warp/testspeed.py",
+    "mujoco_warp/viewer.py",
+    "mujoco_warp/record.py",
+]
+
+[tool.coverage.report]
+# Warp `@wp.kernel` / `@wp.func` bodies are transpiled and executed on the GPU
+# device, so CPython never runs those lines and coverage.py always reports them
+# as missed. Exclude the decorated functions from line coverage; their behavior
+# is validated by numeric result assertions in the test suite instead. This
+# makes the reported number reflect the measurable host (Python) code.
+exclude_also = [
+    "^\\s*@wp\\.kernel",
+    "^\\s*@wp\\.func",
+    "^\\s*@nested_kernel",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]
+
 [tool.setuptools]
 package-data = { "mujoco_warp" = ["test_data/**"] }
 

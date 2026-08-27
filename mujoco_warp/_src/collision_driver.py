@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 from typing import Any
 
 import warp as wp
@@ -38,6 +39,10 @@ from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False})
+
+# AMD Opt 5 (broadphase pair caching) is unsound for scenes whose candidate-pair
+# set changes over time, so it is opt-in and disabled by default. See `collision`.
+_BROADPHASE_CACHE_ENABLED = os.environ.get("MJW_HIP_BROADPHASE_CACHE", "0") == "1"
 
 # Corresponding table to MuJoCo's mjCOLLISIONFUNC table in engine_collision_driver.c
 MJ_COLLISION_TABLE = {
@@ -794,14 +799,20 @@ def collision(m: Model, d: Data):
   # zero counters
   wp.launch(_zero_nacon_ncollision, dim=1, outputs=[d.nacon, d.ncollision])
 
-  # AMD Opt 5: Static geom pair caching.
-  # For rigid robots, the broadphase pair list is nearly constant each step.
-  # Cache the collision context after the first step and reuse on subsequent steps.
+  # AMD Opt 5: Static geom pair caching (opt-in, default OFF).
+  # For rigid robots that stay in persistent contact, the broadphase pair list
+  # is nearly constant each step, so caching it after the first step and reusing
+  # it avoids re-running broadphase. This is UNSOUND in general: any scene where
+  # the candidate-pair set changes over time (e.g. a body falling toward a plane,
+  # objects approaching or separating) will miss newly-formed collisions because
+  # the stale cached pair list is reused, causing bodies to pass through each
+  # other. Correctness is therefore the default; enable this optimization only
+  # for workloads known to have a static pair set via MJW_HIP_BROADPHASE_CACHE=1.
   # CRITICAL: must still run narrowphase (contact positions change each step).
   # CRITICAL: nacon must be zeroed before narrowphase regardless.
   _run_broadphase = True
   device = wp.get_device()
-  if device.is_hip:
+  if device.is_hip and _BROADPHASE_CACHE_ENABLED:
     if hasattr(d, "_bvh_cached_ctx") and d._bvh_cached_ctx is not None:
       # Reuse cached broadphase result
       ctx = d._bvh_cached_ctx
@@ -814,8 +825,8 @@ def collision(m: Model, d: Data):
       nxn_broadphase(m, d, ctx)
     else:
       sap_broadphase(m, d, ctx)
-    # Cache for next step on AMD
-    if device.is_hip:
+    # Cache for next step on AMD (only when caching is enabled)
+    if device.is_hip and _BROADPHASE_CACHE_ENABLED:
       d._bvh_cached_ctx = ctx
   else:
     # Reuse cached pairs — but must still zero nacon/ncollision for narrowphase
