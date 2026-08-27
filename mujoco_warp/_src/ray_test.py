@@ -36,9 +36,13 @@ def _assert_eq(a, b, name):
 
 # TODO: Add tests comparing normal to engine implementation once available.
 # Every test below also exercises the BVH-accelerated raycast path via
-# `create_render_context`, which relies on the cuBQL BVH builder. cuBQL is
-# unavailable on HIP/ROCm, so the whole suite is skipped on those devices.
-@absltest.skipUnless(test_data.supports_cubql(), "Skipping ray tests that require cuBQL BVH (unsupported on HIP/ROCm).")
+# `create_render_context`, which relies on the cuBQL BVH builder and CUDA
+# textures. CUDA textures are unavailable on HIP/ROCm, so the whole suite is
+# skipped on those devices.
+@absltest.skipUnless(test_data.supports_cubql(), "Skipping ray tests that require cuBQL BVH.")
+@absltest.skipUnless(
+  test_data.supports_texture(), "Skipping ray tests that require CUDA textures (unsupported on HIP/ROCm)."
+)
 class RayTest(absltest.TestCase):
   def test_ray_nothing(self):
     """Tests that ray returns -1 when nothing is hit."""
@@ -490,6 +494,49 @@ class RayTest(absltest.TestCase):
     _assert_eq(bvh_geomid_np, geomid_np, "geom_id")
     _assert_eq(bvh_dist_np, dist_np, "dist")
     _assert_eq(bvh_normal_np, normal_np, "normal")
+
+
+class RayNoBVHTest(absltest.TestCase):
+  """Non-BVH ray path (`rc=None`).
+
+  Exercises the `ray()` host wrapper and the `_ray` kernel without a render
+  context, so it runs on all backends (no cuBQL / CUDA textures required).
+  """
+
+  def test_ray_miss_returns_negative(self):
+    mjm, mjd, m, d = test_data.fixture("ray.xml")
+
+    pnt = wp.array([wp.vec3(12.146, 1.865, 3.895)], dtype=wp.vec3).reshape((1, 1))
+    vec = wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3).reshape((1, 1))
+    dist, geomid, normal = mjw.ray(m, d, pnt, vec)
+    wp.synchronize()
+    _assert_eq(geomid.numpy()[0, 0], -1, "geom_id")
+    _assert_eq(dist.numpy()[0, 0], -1, "dist")
+    _assert_eq(normal.numpy()[0, 0], 0, "normal")
+
+  def test_ray_hit_matches_mujoco(self):
+    mjm, mjd, m, d = test_data.fixture("ray.xml")
+
+    # looking down at the sphere (geom 1) at a slight angle
+    pnt = wp.array([wp.vec3(0.0, 0.0, 1.6)], dtype=wp.vec3).reshape((1, 1))
+    vec = wp.array([wp.normalize(wp.vec3(0.1, 0.2, -1.0))], dtype=wp.vec3).reshape((1, 1))
+    dist, geomid, normal = mjw.ray(m, d, pnt, vec)
+    wp.synchronize()
+
+    pnt_np, vec_np = pnt.numpy()[0, 0], vec.numpy()[0, 0]
+    unused = np.zeros(1, dtype=np.int32)
+    mj_dist = mujoco.mj_ray(mjm, mjd, pnt_np, vec_np, None, 1, -1, unused)
+    _assert_eq(geomid.numpy()[0, 0], 1, "geom_id")
+    _assert_eq(dist.numpy()[0, 0], mj_dist, "dist")
+
+  def test_ray_default_geomgroup(self):
+    # geomgroup=None takes the default all-(-1) mask branch in ray().
+    mjm, mjd, m, d = test_data.fixture("ray.xml")
+    pnt = wp.array([wp.vec3(0.0, 0.0, 1.6)], dtype=wp.vec3).reshape((1, 1))
+    vec = wp.array([wp.normalize(wp.vec3(0.0, 0.0, -1.0))], dtype=wp.vec3).reshape((1, 1))
+    dist, geomid, normal = mjw.ray(m, d, pnt, vec, geomgroup=None, flg_static=True)
+    wp.synchronize()
+    self.assertGreaterEqual(int(geomid.numpy()[0, 0]), 0)
 
 
 if __name__ == "__main__":

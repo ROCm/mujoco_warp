@@ -33,15 +33,18 @@ def supports_graph_capture() -> bool:
   available. Tests that wrap kernels in `wp.ScopedCapture` should be guarded
   with this helper.
   """
-  return wp.get_device().supports_graph_capture
+  device = wp.get_device()
+  # Some HIP/ROCm Warp builds report `supports_graph_capture == True`, but
+  # native capture fails at runtime ("Cannot synchronize stream while graph
+  # capture is active"), so treat HIP devices as unsupported.
+  return device.supports_graph_capture and not device.is_hip
 
 
 def supports_cubql() -> bool:
   """Whether the active Warp device supports the cuBQL BVH builder.
 
-  This is False on HIP/ROCm devices (and on builds without cuBQL support).
-  Tests that build a render context / BVH (e.g. via `create_render_context`)
-  should be guarded with this helper.
+  This is False on builds without cuBQL support. Tests that build a BVH
+  (e.g. via `create_render_context`) should be guarded with this helper.
   """
   return wp.get_device().supports_cubql
 
